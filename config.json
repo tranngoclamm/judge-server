@@ -1,0 +1,29 @@
+{
+    "host": "http://localhost",
+    "problem_storage_globs": ["/home/viet/puoj/site/dmoj/problems/*"],
+    "port": 9999,
+    "executors": [
+      "c",
+      "cpp",
+      "python3",
+      "java",
+      "PAS",
+      "CPP20"
+    ],
+    "runtime": [
+      "ccl: /opt/ccl/lx86cl",
+      "sed: /bin/sed",
+      "awk: /usr/bin/awk",
+      "gnatmake: /usr/bin/gnatmake",
+      "chicken-csc: /usr/bin/csc",
+      "dart: /opt/dart-sdk/bin/dart",
+      "tclsh: /usr/bin/tclsh",
+      "cobc: /usr/bin/cobc",
+      "erl: /usr/bin/erl",
+      "erlc: /usr/bin/erlc"
+    ],
+    "work_dir": "/tmp/dmoj",
+    "log_level": "info"
+  }
+  
+  

@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import traceback
 from enum import Enum
 from http.server import HTTPServer
@@ -15,9 +16,9 @@ from typing import Any, Callable, Dict, Generator, List, NamedTuple, Optional, S
 from dmoj import packet
 from dmoj.control import JudgeControlRequestHandler
 from dmoj.error import CompileError
-from dmoj.judgeenv import clear_problem_dirs_cache, env, get_supported_problems_and_mtimes, startup_warnings
+from dmoj.judgeenv import ConfigNode, env, get_supported_problems_and_mtimes, startup_warnings
 from dmoj.monitor import Monitor
-from dmoj.problem import BaseTestCase, BatchedTestCase, Problem, TestCase
+from dmoj.problem import BaseTestCase, BatchedTestCase, MemoryIO, Problem, TestCase
 from dmoj.result import Result
 from dmoj.utils import builtin_int_patch
 from dmoj.utils.ansi import ansi_style, print_ansi, strip_ansi
@@ -44,6 +45,7 @@ class IPC(Enum):
     GRADING_ABORTED = 'GRADING-ABORTED'
     UNHANDLED_EXCEPTION = 'UNHANDLED-EXCEPTION'
     REQUEST_ABORT = 'REQUEST-ABORT'
+    #IDE_OUTPUT = auto()
 
 
 # This needs to be at least as large as the timeout for the largest compiler time limit, but we don't enforce that here.
@@ -60,6 +62,7 @@ Submission = NamedTuple(
     [
         ('id', int),
         ('problem_id', str),
+        ('storage_namespace', Optional[str]),
         ('language', str),
         ('source', str),
         ('time_limit', float),
@@ -101,8 +104,12 @@ class Judge:
             #    thread.join()
 
             try:
-                clear_problem_dirs_cache()
                 self.packet_manager.supported_problems_packet(get_supported_problems_and_mtimes())
+
+                # When copying large test file, updater_signal can be set multiple times in very short burst
+                # (e.g. 10 times during 0.2s). Meanwhile, bridged can take up to 1 seconds to process updates.
+                # Let's just wait a few seconds to avoid spamming bridged.
+                time.sleep(3)
             except Exception:
                 log.exception('Failed to update problems.')
 
@@ -208,7 +215,7 @@ class Judge:
         is_sc = result.result_flag & Result.SC
         colored_codes = ['#ansi[%s](%s|bold)' % ('--' if x == 'SC' else x, Result.COLORS_BYID[x]) for x in codes]
         colored_aux_codes = '{%s}' % ', '.join(colored_codes[1:]) if len(codes) > 1 else ''
-        colored_feedback = '(#ansi[%s](|underline)) ' % utf8text(result.feedback) if result.feedback else ''
+        colored_feedback = '(#ansi[%s](|underline)) ' % utf8text(result.feedback, 'replace') if result.feedback else ''
         if is_sc:
             case_info = ''
         else:
@@ -299,7 +306,6 @@ class Judge:
             self.packet_manager.internal_error_packet(strip_ansi(message))
         except Exception:  # noqa E722: don't want `log_internal_error` to trigger `log_internal_error`, ever
             logger.exception('Error encountered while reporting error to site!')
-
 
 class JudgeWorker:
     def __init__(self, submission: Submission) -> None:
@@ -439,37 +445,125 @@ class JudgeWorker:
                 if ipc_recv_thread.is_alive():
                     logger.error('Judge IPC recv thread is still alive after timeout, shutting worker down anyway!')
 
-            # FIXME(tbrindus): we need to do this because cleaning up temporary directories happens on __del__, which
-            # won't get called if we exit the process right now (so we'd leak all files created by the grader). This
-            # should be refactored to have an explicit `cleanup()` or similar, rather than relying on refcounting
-            # working out.
-            from dmoj.executors.compiled_executor import _CompiledExecutorMeta
-
-            for cached_executor in _CompiledExecutorMeta.compiled_binary_cache.values():
-                cached_executor.is_cached = False
-                cached_executor.cleanup()
             self.grader = None
 
     def _grade_cases(self) -> Generator[Tuple[IPC, tuple], None, None]:
         problem = Problem(
-            self.submission.problem_id, self.submission.time_limit, self.submission.memory_limit, self.submission.meta
+            self.submission.problem_id,
+            self.submission.time_limit,
+            self.submission.memory_limit,
+            self.submission.meta,
+            # storage_namespace=self.submission.storage_namespace,
         )
+        # 👉 XỬ LÝ CHẾ ĐỘ IDE: nếu submission có input từ IDE
+        
+        is_ide_mode = self.submission.problem_id == 'run_ide'
+        source = self.submission.source
+        ide_input = self.submission.meta.get('ide_input', '')
 
+
+        # Phần compile giống nhau cho cả 2 chế độ
         try:
             self.grader = problem.grader_class(
-                self, problem, self.submission.language, utf8bytes(self.submission.source)
+                self, problem, self.submission.language, utf8bytes(source)
             )
-        except CompileError as compilation_error:
-            error = compilation_error.message
-            yield IPC.COMPILE_ERROR, (error,)
+        except CompileError as ce:
+            logger.error("Error 488: ", utf8bytes(source) )
+            yield IPC.COMPILE_ERROR, (ce.message,)
             return
         else:
             warning = getattr(self.grader.binary, 'warning', None)
             if warning is not None:
                 yield IPC.COMPILE_MESSAGE, (warning,)
+        
+        # Báo bắt đầu chấm điểm
+        run_pretests_only = False if is_ide_mode else problem.run_pretests_only
+        yield IPC.GRADING_BEGIN, (run_pretests_only,)
+        
+        # Xử lý riêng cho chế độ IDE
+        if is_ide_mode:
+            import tempfile
+            import os
+            
+            with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_input_file:
+                temp_input_file.write(ide_input)
+                temp_input_file.flush()
+                input_path = temp_input_file.name
+            
+            try:
+                # Cấu hình cho IDE mode
+                config = ConfigNode({
+                    'in': input_path,
+                    'out': '',  # Output trống vì chúng ta không so sánh
+                    'points': 0,
+                    'wall_time_factor': 1.0,
+                    'generator': None,
+                    'time_limit': self.submission.time_limit,
+                    'memory_limit': self.submission.memory_limit,
+                    'checker': 'standard',
+                    'output_prefix_length': 0,
+                    'binary_data': False,
+                    'symlinks': {},
+                })
+                
+                # Tạo test case với config đúng
+                fake_case = TestCase(
+                    count=1, 
+                    batch_no=0,
+                    config=config,
+                    problem=problem
+                )
+                
+                # Chạy grader để lấy kết quả
+                original_result = self.grader.grade(fake_case)
+                if self._abort_requested:
+                    yield IPC.GRADING_ABORTED, ()
+                    return
+                
+                # Tạo một kết quả mới, luôn đánh dấu là AC và chỉ chứa output thực tế
+                # Điều này đảm bảo IDE luôn trả về output thay vì kết quả đánh giá
+                ide_result = Result(
+                    case=fake_case,
+                    result_flag=Result.AC,  # Luôn đánh dấu là Accepted cho IDE
+                    execution_time=original_result.execution_time,
+                    max_memory=original_result.max_memory
+                )
+                
+                # Gán output thực tế từ kết quả gốc
+                ide_result.proc_output = original_result.proc_output
 
-        yield IPC.GRADING_BEGIN, (problem.run_pretests_only,)
-
+                # Thêm thông tin về lỗi runtime nếu có
+                if original_result.result_flag & Result.RTE:
+                    ide_result.feedback = f"Runtime Error: {original_result.feedback}" if hasattr(original_result, 'feedback') else "Runtime Error"
+                
+                # Trả về kết quả IDE
+                yield IPC.RESULT, (None, 1, ide_result)
+                
+                
+            except Exception as e:
+                logger.error(f'Lỗi IDE mode: {e}')
+                if 'fake_case' not in locals():
+                    config = ConfigNode({'in': input_path, 'out': ''})
+                    fake_case = TestCase(count=1, batch_no=0, config=config, problem=problem)
+                error_result = Result(
+                    case=fake_case, 
+                    result_flag=Result.AC,  # Vẫn đánh dấu là AC
+                    execution_time=0, 
+                    max_memory=0
+                )
+                error_result.proc_output = utf8bytes(error_result.output)
+                yield IPC.RESULT, (None, 1, error_result)
+            finally:
+                # Đảm bảo xóa file tạm
+                try:
+                    if os.path.exists(input_path):
+                        os.remove(input_path)
+                except Exception as e:
+                    logger.warning(f'Lỗi khi xóa file tạm IDE: {e}')
+            
+            yield IPC.GRADING_END, ()
+            return
+        
         flattened_cases: List[Tuple[Optional[int], BaseTestCase]] = []
         batch_number = 0
         batch_dependencies: List[Set[int]] = []
@@ -485,6 +579,8 @@ class JudgeWorker:
         case_number = 0
         is_short_circuiting = False
         is_short_circuiting_enabled = self.submission.short_circuit
+        judged_results: Dict[Tuple[str, str], Optional[Result]] = {}
+        result: Optional[Result] = None
         passed_batches: Set[int] = set()
         for batch_number, cases in groupby(flattened_cases, key=itemgetter(0)):
             if batch_number:
@@ -496,14 +592,29 @@ class JudgeWorker:
 
             for _, case in cases:
                 case_number += 1
+                assert isinstance(case, TestCase)
 
                 # Stop grading if we're short circuiting
                 if is_short_circuiting:
-                    assert isinstance(case, TestCase)
                     result = Result(case, result_flag=Result.SC)
                 else:
-                    assert isinstance(case, TestCase)
-                    result = self.grader.grade(case)
+                    case_cache_key = (case.config['in'], case.config['out'])
+                    result = judged_results.get(case_cache_key, None)
+
+                    if result is None:
+                        result = self.grader.grade(case)
+                        # only cache on case has positive points
+                        if case.points != 0 and case_cache_key != (None, None):
+                            judged_results[case_cache_key] = result
+                    else:
+                        # TODO: this is a bit of a hack, but it's the best we can do for now
+
+                        # Cache hit, now we need to change the points of the result
+                        # new_points = new_case_points * old_points / old_case_points
+
+                        # result.case.points will always positive, since we only cache cases that have non-zero points
+                        result.points = case.points * result.points / result.case.points
+                        result.case = case
 
                     # If the submission was killed due to a user-initiated abort, any result is meaningless.
                     if self._abort_requested:

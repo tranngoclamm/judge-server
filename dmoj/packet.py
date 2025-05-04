@@ -255,19 +255,22 @@ class PacketManager:
         elif name == 'submission-request':
             self.submission_acknowledged_packet(packet['submission-id'])
             from dmoj.judge import Submission
+            is_ide_mode = packet['problem-id']== 'run_ide'
+            ide_input = packet['meta'].get('ide_input', '')           
 
-            self.judge.begin_grading(
-                Submission(
-                    id=packet['submission-id'],
-                    problem_id=packet['problem-id'],
-                    language=packet['language'],
-                    source=packet['source'],
-                    time_limit=float(packet['time-limit']),
-                    memory_limit=int(packet['memory-limit']),
-                    short_circuit=packet['short-circuit'],
-                    meta=packet['meta'],
-                )
+            submission = Submission(
+                id=packet['submission-id'],
+                problem_id=packet['problem-id'],
+                storage_namespace=packet.get('storage-namespace'),
+                language=packet['language'],
+                source=packet['source'],
+                time_limit=float(packet['time-limit']),
+                memory_limit=int(packet['memory-limit']),
+                short_circuit=packet['short-circuit'],
+                meta={'ide_input': ide_input} if is_ide_mode else {}, 
             )
+
+            self.judge.begin_grading(submission)
             self._batch = 0
             log.info(
                 'Accept submission: %d: executor: %s, code: %s',
@@ -314,6 +317,25 @@ class PacketManager:
             result.points,
             result.total_points,
         )
+        self._send_packet({
+            'name': 'testcase-ide',
+            'result': {
+                'case': result.case.__dict__,
+                'current_submission_id': self.judge.current_submission.id,
+                'result_flag': result.result_flag,
+                'execution_time': result.execution_time,
+                'wall_clock_time': result.wall_clock_time,
+                'max_memory': result.max_memory,
+                'context_switches': result.context_switches,
+                'runtime_version': result.runtime_version,
+                'proc_output': result.proc_output.decode('utf-8', errors='replace'),
+                'feedback': result.feedback,
+                'extended_feedback': result.extended_feedback,
+                'points': result.points,
+                'readable_codes': result.readable_codes()
+            }
+        })
+
         with self._testcase_queue_lock:
             self._testcase_queue.append((position, result))
 
