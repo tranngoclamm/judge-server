@@ -1,7 +1,7 @@
 id: judge1
 key: LurlH6AU5powkz5afnfuml5euXF3BeGUKZ31QzGBvutRS74pPiSsrWwOA 
 problem_storage_globs:
-  - /home/viet/puoj/site/dmoj/problems/*
+  - /tmp/problem_data/*
 runtime:
   as_x64: /usr/bin/x86_64-linux-gnu-as
   as_x86: /usr/bin/as
